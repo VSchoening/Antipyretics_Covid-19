@@ -1,0 +1,733 @@
+---
+title: "230823_Covid_NSAID_APAP_workflow"
+author: "Aurélie Pahud de Mortanges"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load libraries
+library(tidyverse)
+library(dplyr)
+library(writexl)
+library(caret)
+library(magrittr)
+library(rpart)
+library(rpart.plot)
+library(gridExtra)
+library(dendroTools)
+library(randomForest)
+library(imputeTS)
+library(zoo)
+
+```
+
+
+# CASE CONTROL STUDY NSAID/KIDNEY
+
+## Modeling
+
+### case control study NSAID/kidney: prepare for modeling 
+```{r}
+
+load(file="data_kidney.Rdata")
+
+# split train and test set
+set.seed(42)
+index <- createDataPartition(y = ren_plaus_dem_to_model$outcome, p = 0.8, list = F, times = 1)
+
+train_data_kidney <- ren_plaus_dem_to_model[index,]
+test_data_kidney <- ren_plaus_dem_to_model[-index,]
+
+# standardize data
+pp <- preProcess(train_data_kidney, method = "range", rangeBounds = c(0,1))
+train_data_kidney_stand <- predict(pp, train_data_kidney)
+test_data_kidney_stand <- predict(pp, test_data_kidney)
+
+# set up model weights
+my_weights <- if_else(train_data_kidney$outcome == "case",
+                      (1/sum(train_data_kidney$outcome == "case")) * 0.5,
+                      (1/sum(train_data_kidney$outcome == "control")) * 0.5)
+
+```
+
+
+
+### case control study NSAID/kidney: logistic regression with caret
+```{r warning=FALSE}
+
+# set up train control
+lr_train_control <- trainControl(method = "cv",
+                                 number = 5,
+                                 classProbs = TRUE,
+                                 summaryFunction = twoClassSummary,
+                                 seeds = c(1:6))
+
+set.seed(42)
+lr_model <- caret::train(outcome ~ ., 
+                         data = train_data_kidney_stand,
+                         trControl = lr_train_control,
+                         weights = my_weights,
+                         method = "glm",
+                         family = "binomial",
+                         metric = "ROC")
+
+# calculate confusion matrix and metrics train
+lr_predicted_values_train <- predict(lr_model, newdata = train_data_kidney_stand)
+lr_actual_values_train <- as.factor(train_data_kidney$outcome)
+lr_conf_matrix_train <- confusionMatrix(lr_predicted_values_train, lr_actual_values_train, positive = "case")
+lr_conf_matrix_train
+
+# calculate confusion matrix test
+lr_predicted_values_test <- predict(lr_model, newdata = test_data_kidney_stand)
+lr_actual_values_test <- as.factor(test_data_kidney_stand$outcome)
+lr_conf_matrix_test <- confusionMatrix(lr_predicted_values_test, lr_actual_values_test, positive = "case")
+lr_conf_matrix_test
+
+rm(lr_predicted_values_train, lr_actual_values_train, lr_predicted_values_test, lr_actual_values_test)
+
+```
+
+### case control study NSAID/kidney: custom tuned decision tree
+```{r}
+
+set.seed(42)
+dt_model2 <- rpart(outcome ~ ., 
+                   data = train_data_kidney, 
+                   method = "class",
+                   cp = 0.002, minbucket = 9, minsplit = 5, maxdepth = 8)
+
+dt_predicted_values_train2 <- predict(dt_model2, newdata = train_data_kidney, type = "class")
+dt_actual_values_train2 <- as.factor(train_data_kidney$outcome)
+dt_conf_matrix_train2 <- confusionMatrix(dt_predicted_values_train2, dt_actual_values_train2, positive = "case")
+dt_conf_matrix_train2
+
+dt_predicted_values_test2 <- predict(dt_model2, newdata = test_data_kidney, type = "class")
+dt_actual_values_test2 <- as.factor(test_data_kidney$outcome)
+dt_conf_matrix_test2 <- confusionMatrix(dt_predicted_values_test2, dt_actual_values_test2, positive = "case")
+dt_conf_matrix_test2
+
+# make nice visualization
+pdf("decisionTree_NSAID_231101.pdf", height = 5, width = 7)
+prp(dt_model2, branch = 1, box.palette = c("#a4c3d8", "#eb8c5a"), cex = 0.5, type = 5, varlen = 12)
+dev.off()
+
+rm(dt_predicted_values_train2, dt_actual_values_train2, dt_predicted_values_test2, dt_actual_values_test2)
+
+```
+
+### case control study NSAID/kidney: knn with caret
+```{r}
+
+# set up train control
+knn_train_control <- trainControl(method = "cv",
+                                 number = 5,
+                                 classProbs = TRUE,
+                                 summaryFunction = twoClassSummary,
+                                 seeds = list(c(1:10), c(11:20), c(21:30), c(31:40), c(41:50), 51))
+
+# knn needs standardized data
+set.seed(42)
+knn_model <- caret::train(outcome ~., data = train_data_kidney_stand, 
+                   method = "knn", 
+                   trControl = knn_train_control, 
+                   tuneLength = 10,
+                   weights = my_weights,
+                   metric = "ROC") 
+
+# calculate confusion matrix and metrics train
+knn_predicted_values_train <- predict(knn_model, newdata = train_data_kidney_stand)
+knn_actual_values_train <- as.factor(train_data_kidney$outcome)
+knn_conf_matrix_train <- confusionMatrix(knn_predicted_values_train, knn_actual_values_train, positive = "case")
+knn_conf_matrix_train
+
+# calculate confusion matrix test
+knn_predicted_values_test <- predict(knn_model, newdata = test_data_kidney_stand)
+knn_actual_values_test <- as.factor(test_data_kidney_stand$outcome)
+knn_conf_matrix_test <- confusionMatrix(knn_predicted_values_test, knn_actual_values_test, positive = "case")
+knn_conf_matrix_test
+
+rm(knn_predicted_values_train, knn_actual_values_train, knn_predicted_values_test, knn_actual_values_test)
+```
+
+
+### case control study NSAID/kidney: custom tuned random Forest from Verena, adapted, part 2
+```{r}
+
+# run RF with optimal parameters
+set.seed(42)
+rf_model2 <- randomForest(x = train_data_kidney[, -4], y = as.factor(train_data_kidney$outcome) , maxnodes = 5, ntree = 60, weights = my_weights)
+
+# calculate confusion matrix train
+rf_predicted_values_train2 <- predict(rf_model2, train_data_kidney[, -4])
+rf_actual_values_train2 <- as.factor(train_data_kidney$outcome)
+rf_conf_matrix_train2 <- confusionMatrix(rf_predicted_values_train2, rf_actual_values_train2, positive = "case")
+rf_conf_matrix_train2
+
+# calculate confusion matrix test
+rf_predicted_values_test2 <- predict(rf_model2, test_data_kidney[, -4])
+rf_actual_values_test2 <- as.factor(test_data_kidney$outcome)
+rf_conf_matrix_test2 <- confusionMatrix(rf_predicted_values_test2, rf_actual_values_test2, positive = "case")
+rf_conf_matrix_test2
+
+rm(rf_predicted_values_train2, rf_predicted_values_test2, rf_actual_values_train2, rf_actual_values_test2)
+```
+
+### case control study NSAID/kidney: AdaBoost with caret
+```{r}
+
+# set up train control
+ada_train_control <- trainControl(method = "cv",
+                                 number = 5,
+                                 classProbs = TRUE,
+                                 summaryFunction = twoClassSummary)
+
+ada_grid <- expand.grid(mfinal = seq(100, 200, by = 20), 
+                       maxdepth = seq(2, 5, by = 1),
+                       coeflearn = c("Breiman", "Freund"))
+
+set.seed(42)
+ada_model <- caret::train(outcome ~ ., 
+                  data = train_data_kidney, 
+                  method = "AdaBoost.M1", 
+                  tuneGrid = ada_grid,
+                  trControl = ada_train_control,
+                  weights = my_weights,
+                  metric = "ROC")
+
+# calculate confusion matrix train
+ada_predicted_values_train <- predict(ada_model, newdata = train_data_kidney)
+ada_actual_values_train <- as.factor(train_data_kidney$outcome)
+ada_conf_matrix_train <- confusionMatrix(ada_predicted_values_train, ada_actual_values_train, positive = "case")
+ada_conf_matrix_train
+
+# calculate confusion matrix test
+ada_predicted_values_test <- predict(ada_model, newdata = test_data_kidney)
+ada_actual_values_test <- as.factor(test_data_kidney$outcome)
+ada_conf_matrix_test <- confusionMatrix(ada_predicted_values_test, ada_actual_values_test, positive = "case")
+ada_conf_matrix_test
+
+rm(ada_predicted_values_train, ada_predicted_values_test, ada_actual_values_train, ada_actual_values_test)
+
+```
+
+## Results
+
+###  case control study NSAID/kidney: assemble results
+```{r}
+
+# logistic regression caret
+lr_overall_train <- lr_conf_matrix_train$overall
+lr_accConf_train <- paste(round(lr_overall_train[["Accuracy"]], digits = 2), " (", round(lr_overall_train[["AccuracyLower"]], digits = 2), " - ", round(lr_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+lr_byClass_train <- lr_conf_matrix_train$byClass
+lr_sens_train <- lr_byClass_train["Sensitivity"]
+lr_spec_train <- lr_byClass_train["Specificity"]
+lr_PPV_train <- lr_byClass_train["Pos Pred Value"]
+lr_NPV_train <- lr_byClass_train["Neg Pred Value"]
+lr_prec_train <- lr_byClass_train["Precision"]
+lr_rec_train <- lr_byClass_train["Recall"]
+lr_F1_train <- lr_byClass_train["F1"]
+lr_balAc_train <- lr_byClass_train["Balanced Accuracy"]
+
+lr_overall_test <- lr_conf_matrix_test$overall
+lr_accConf_test <- paste(round(lr_overall_test[["Accuracy"]], digits = 2), " (", round(lr_overall_test[["AccuracyLower"]], digits = 2), " - ", round(lr_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+lr_byClass_test <- lr_conf_matrix_test$byClass
+lr_sens_test <- lr_byClass_test["Sensitivity"]
+lr_spec_test <- lr_byClass_test["Specificity"]
+lr_PPV_test <- lr_byClass_test["Pos Pred Value"]
+lr_NPV_test <- lr_byClass_test["Neg Pred Value"]
+lr_prec_test <- lr_byClass_test["Precision"]
+lr_rec_test <- lr_byClass_test["Recall"]
+lr_F1_test <- lr_byClass_test["F1"]
+lr_balAc_test <- lr_byClass_test["Balanced Accuracy"]
+
+LR_train = c(lr_balAc_train, lr_sens_train, lr_spec_train, lr_PPV_train, lr_NPV_train, lr_prec_train, lr_rec_train, lr_F1_train)
+LR_test = c(lr_balAc_test, lr_sens_test, lr_spec_test, lr_PPV_test, lr_NPV_test, lr_prec_test, lr_rec_test, lr_F1_test)
+
+rm(lr_overall_train, lr_byClass_train, lr_sens_train, lr_spec_train, lr_PPV_train, lr_NPV_train, lr_prec_train, lr_rec_train, lr_F1_train, lr_balAc_train, lr_overall_test, lr_byClass_test, lr_sens_test, lr_spec_test, lr_PPV_test, lr_NPV_test, lr_prec_test, lr_rec_test, lr_F1_test, lr_balAc_test)
+
+# decision tree custom
+dt2_overall_train <- dt_conf_matrix_train2$overall
+dt2_accConf_train <- paste(round(dt2_overall_train[["Accuracy"]], digits = 2), " (", round(dt2_overall_train[["AccuracyLower"]], digits = 2), " - ", round(dt2_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+dt2_byClass_train <- dt_conf_matrix_train2$byClass
+dt2_sens_train <- dt2_byClass_train["Sensitivity"]
+dt2_spec_train <- dt2_byClass_train["Specificity"]
+dt2_PPV_train <- dt2_byClass_train["Pos Pred Value"]
+dt2_NPV_train <- dt2_byClass_train["Neg Pred Value"]
+dt2_prec_train <- dt2_byClass_train["Precision"]
+dt2_rec_train <- dt2_byClass_train["Recall"]
+dt2_F1_train <- dt2_byClass_train["F1"]
+dt2_balAc_train <- dt2_byClass_train["Balanced Accuracy"]
+
+dt2_overall_test <- dt_conf_matrix_test2$overall
+dt2_accConf_test <- paste(round(dt2_overall_test[["Accuracy"]], digits = 2), " (", round(dt2_overall_test[["AccuracyLower"]], digits = 2), " - ", round(dt2_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+dt2_byClass_test <- dt_conf_matrix_test2$byClass
+dt2_sens_test <- dt2_byClass_test["Sensitivity"]
+dt2_spec_test <- dt2_byClass_test["Specificity"]
+dt2_PPV_test <- dt2_byClass_test["Pos Pred Value"]
+dt2_NPV_test <- dt2_byClass_test["Neg Pred Value"]
+dt2_prec_test <- dt2_byClass_test["Precision"]
+dt2_rec_test <- dt2_byClass_test["Recall"]
+dt2_F1_test <- dt2_byClass_test["F1"]
+dt2_balAc_test <- dt2_byClass_test["Balanced Accuracy"]
+
+DT_train = c(dt2_balAc_train, dt2_sens_train, dt2_spec_train, dt2_PPV_train, dt2_NPV_train, dt2_prec_train, dt2_rec_train, dt2_F1_train)
+DT_test = c(dt2_balAc_test, dt2_sens_test, dt2_spec_test, dt2_PPV_test, dt2_NPV_test, dt2_prec_test, dt2_rec_test, dt2_F1_test)
+
+rm(dt2_sens_train, dt2_spec_train, dt2_PPV_train, dt2_NPV_train, dt2_prec_train, dt2_rec_train, dt2_F1_train, dt2_balAc_train, dt2_sens_test, dt2_spec_test, dt2_PPV_test, dt2_NPV_test, dt2_prec_test, dt2_rec_test, dt2_F1_test, dt2_balAc_test)
+
+# knn caret
+knn_overall_train <- knn_conf_matrix_train$overall
+knn_accConf_train <- paste(round(knn_overall_train[["Accuracy"]], digits = 2), " (", round(knn_overall_train[["AccuracyLower"]], digits = 2), " - ", round(knn_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+knn_byClass_train <- knn_conf_matrix_train$byClass
+knn_sens_train <- knn_byClass_train["Sensitivity"]
+knn_spec_train <- knn_byClass_train["Specificity"]
+knn_PPV_train <- knn_byClass_train["Pos Pred Value"]
+knn_NPV_train <- knn_byClass_train["Neg Pred Value"]
+knn_prec_train <- knn_byClass_train["Precision"]
+knn_rec_train <- knn_byClass_train["Recall"]
+knn_F1_train <- knn_byClass_train["F1"]
+knn_balAc_train <- knn_byClass_train["Balanced Accuracy"]
+
+knn_overall_test <- knn_conf_matrix_test$overall
+knn_accConf_test <- paste(round(knn_overall_test[["Accuracy"]], digits = 2), " (", round(knn_overall_test[["AccuracyLower"]], digits = 2), " - ", round(knn_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+knn_byClass_test <- knn_conf_matrix_test$byClass
+knn_sens_test <- knn_byClass_test["Sensitivity"]
+knn_spec_test <- knn_byClass_test["Specificity"]
+knn_PPV_test <- knn_byClass_test["Pos Pred Value"]
+knn_NPV_test <- knn_byClass_test["Neg Pred Value"]
+knn_prec_test <- knn_byClass_test["Precision"]
+knn_rec_test <- knn_byClass_test["Recall"]
+knn_F1_test <- knn_byClass_test["F1"]
+knn_balAc_test <- knn_byClass_test["Balanced Accuracy"]
+
+KNN_train = c(knn_balAc_train, knn_sens_train, knn_spec_train, knn_PPV_train, knn_NPV_train, knn_prec_train, knn_rec_train, knn_F1_train)
+KNN_test = c(knn_balAc_test, knn_sens_test, knn_spec_test, knn_PPV_test, knn_NPV_test, knn_prec_test, knn_rec_test, knn_F1_test)
+
+rm(knn_sens_train, knn_spec_train, knn_PPV_train, knn_NPV_train, knn_prec_train, knn_rec_train, knn_F1_train, knn_balAc_train, knn_sens_test, knn_spec_test, knn_PPV_test, knn_NPV_test, knn_prec_test, knn_rec_test, knn_F1_test, knn_balAc_test)
+
+# random forest custom
+rf2_overall_train <- rf_conf_matrix_train2$overall
+rf2_accConf_train <- paste(round(rf2_overall_train[["Accuracy"]], digits = 2), " (", round(rf2_overall_train[["AccuracyLower"]], digits = 2), " - ", round(rf2_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+rf2_byClass_train <- rf_conf_matrix_train2$byClass
+rf2_sens_train <- rf2_byClass_train["Sensitivity"]
+rf2_spec_train <- rf2_byClass_train["Specificity"]
+rf2_PPV_train <- rf2_byClass_train["Pos Pred Value"]
+rf2_NPV_train <- rf2_byClass_train["Neg Pred Value"]
+rf2_prec_train <- rf2_byClass_train["Precision"]
+rf2_rec_train <- rf2_byClass_train["Recall"]
+rf2_F1_train <- rf2_byClass_train["F1"]
+rf2_balAc_train <- rf2_byClass_train["Balanced Accuracy"]
+
+rf2_overall_test <- rf_conf_matrix_test2$overall
+rf2_accConf_test <- paste(round(rf2_overall_test[["Accuracy"]], digits = 2), " (", round(rf2_overall_test[["AccuracyLower"]], digits = 2), " - ", round(rf2_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+rf2_byClass_test <- rf_conf_matrix_test2$byClass
+rf2_sens_test <- rf2_byClass_test["Sensitivity"]
+rf2_spec_test <- rf2_byClass_test["Specificity"]
+rf2_PPV_test <- rf2_byClass_test["Pos Pred Value"]
+rf2_NPV_test <- rf2_byClass_test["Neg Pred Value"]
+rf2_prec_test <- rf2_byClass_test["Precision"]
+rf2_rec_test <- rf2_byClass_test["Recall"]
+rf2_F1_test <- rf2_byClass_test["F1"]
+rf2_balAc_test <- rf2_byClass_test["Balanced Accuracy"]
+
+RF_train = c(rf2_balAc_train, rf2_sens_train, rf2_spec_train, rf2_PPV_train, rf2_NPV_train, rf2_prec_train, rf2_rec_train, rf2_F1_train)
+RF_test = c(rf2_balAc_test, rf2_sens_test, rf2_spec_test, rf2_PPV_test, rf2_NPV_test, rf2_prec_test, rf2_rec_test, rf2_F1_test)
+
+rm(rf2_sens_train, rf2_spec_train, rf2_PPV_train, rf2_NPV_train, rf2_prec_train, rf2_rec_train, rf2_F1_train, rf2_balAc_train, rf2_sens_test, rf2_spec_test, rf2_PPV_test, rf2_NPV_test, rf2_prec_test, rf2_rec_test, rf2_F1_test, rf2_balAc_test)
+
+# AdaBoost caret
+ada_overall_train <- ada_conf_matrix_train$overall
+ada_accConf_train <- paste(round(ada_overall_train[["Accuracy"]], digits = 2), " (", round(ada_overall_train[["AccuracyLower"]], digits = 2), " - ", round(ada_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+ada_byClass_train <- ada_conf_matrix_train$byClass
+ada_sens_train <- ada_byClass_train["Sensitivity"]
+ada_spec_train <- ada_byClass_train["Specificity"]
+ada_PPV_train <- ada_byClass_train["Pos Pred Value"]
+ada_NPV_train <- ada_byClass_train["Neg Pred Value"]
+ada_prec_train <- ada_byClass_train["Precision"]
+ada_rec_train <- ada_byClass_train["Recall"]
+ada_F1_train <- ada_byClass_train["F1"]
+ada_balAc_train <- ada_byClass_train["Balanced Accuracy"]
+
+ada_overall_test <- ada_conf_matrix_test$overall
+ada_accConf_test <- paste(round(ada_overall_test[["Accuracy"]], digits = 2), " (", round(ada_overall_test[["AccuracyLower"]], digits = 2), " - ", round(ada_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+ada_byClass_test <- ada_conf_matrix_test$byClass
+ada_sens_test <- ada_byClass_test["Sensitivity"]
+ada_spec_test <- ada_byClass_test["Specificity"]
+ada_PPV_test <- ada_byClass_test["Pos Pred Value"]
+ada_NPV_test <- ada_byClass_test["Neg Pred Value"]
+ada_prec_test <- ada_byClass_test["Precision"]
+ada_rec_test <- ada_byClass_test["Recall"]
+ada_F1_test <- ada_byClass_test["F1"]
+ada_balAc_test <- ada_byClass_test["Balanced Accuracy"]
+
+AB_train = c(ada_balAc_train, ada_sens_train, ada_spec_train, ada_PPV_train, ada_NPV_train, ada_prec_train, ada_rec_train, ada_F1_train)
+AB_test = c(ada_balAc_test, ada_sens_test, ada_spec_test, ada_PPV_test, ada_NPV_test, ada_prec_test, ada_rec_test, ada_F1_test)
+
+rm(ada_overall_train, ada_sens_train, ada_spec_train, ada_PPV_train, ada_NPV_train, ada_prec_train, ada_rec_train, ada_F1_train, ada_balAc_train, ada_overall_test, ada_sens_test, ada_spec_test, ada_PPV_test, ada_NPV_test, ada_prec_test, ada_rec_test, ada_F1_test, ada_balAc_test)
+
+# assemble table
+results_NSAID_table <- round_df(data.frame(LR_train, LR_test, DT_train, DT_test, RF_train, RF_test, KNN_train, KNN_test, AB_train, AB_test), digits = 2)
+
+# accuracy
+accConf <- c(lr_accConf_train, lr_accConf_test, dt2_accConf_train, dt2_accConf_test, rf2_accConf_train, rf2_accConf_test, knn_accConf_train, knn_accConf_test, ada_accConf_train, ada_accConf_test)
+
+results_NSAID_table <- rbind(accConf, results_NSAID_table)
+rownames(results_NSAID_table) <- c("Accuracy", "Balanced Accuracy", "Sensitivity", "Specificity", "PPV", "NPV", "Precision", "Recall", "F1 Score")
+
+write_xlsx(results_NSAID_table, "results_NSAIDs_231101.xlsx")
+
+pdf("results_NSAIDs_231109.pdf", width = 18, height = 5)
+results_NSAID_table <- tableGrob(data.frame(results_NSAID_table))
+grid.arrange(results_NSAID_table)
+dev.off()
+
+```
+
+# CASE CONTROL STUDY APAP/LIVER
+
+## Modeling
+
+### case control study APAP/liver: prepare for modeling 
+```{r}
+
+load(file="data_liver.Rdata")
+
+# split train and test set
+set.seed(42)
+index <- createDataPartition(y = hep_plaus_dem_to_model$outcome, p = 0.8, list = F, times = 1)
+
+train_data_liver <- hep_plaus_dem_to_model[index,]
+test_data_liver <- hep_plaus_dem_to_model[-index,]
+
+# standardize data
+pp <- preProcess(train_data_liver, method = "range", rangeBounds = c(0,1))
+train_data_liver_stand <- predict(pp, train_data_liver)
+test_data_liver_stand <- predict(pp, test_data_liver)
+
+# set up train control
+my_train_control <- trainControl(method = "cv",
+                                 number = 5,
+                                 classProbs = TRUE,
+                                 summaryFunction = twoClassSummary)
+
+# set up model weights
+my_weights <- if_else(train_data_liver$outcome == "case",
+                      (1/sum(train_data_liver$outcome == "case")) * 0.5,
+                      (1/sum(train_data_liver$outcome == "control")) * 0.5)
+
+```
+
+
+### case control study APAP/liver: logistic regression with caret
+```{r warning=FALSE}
+set.seed(42)
+
+lr_model <- caret::train(outcome ~ ., 
+                         data = train_data_liver_stand,
+                         trControl = my_train_control,
+                         weights = my_weights,
+                         method = "glm",
+                         family = "binomial",
+                         metric = "ROC")
+
+# calculate confusion matrix and metrics train
+lr_predicted_values_train <- predict(lr_model, newdata = train_data_liver_stand)
+lr_actual_values_train <- as.factor(train_data_liver$outcome)
+lr_conf_matrix_train <- confusionMatrix(lr_predicted_values_train, lr_actual_values_train, positive = "case")
+lr_conf_matrix_train
+
+# calculate confusion matrix test
+lr_predicted_values_test <- predict(lr_model, newdata = test_data_liver_stand)
+lr_actual_values_test <- as.factor(test_data_liver_stand$outcome)
+lr_conf_matrix_test <- confusionMatrix(lr_predicted_values_test, lr_actual_values_test, positive = "case")
+lr_conf_matrix_test
+
+rm(lr_predicted_values_train, lr_actual_values_train, lr_predicted_values_test, lr_actual_values_test)
+
+```
+
+### case control study APAP/liver: custom tuned decision tree
+```{r}
+
+set.seed(42)
+dt_model2 <- rpart(outcome ~ ., 
+                   data = train_data_liver, 
+                   method = "class",
+                   cp = 0.001, minbucket = 8, minsplit = 3, maxdepth = 5)
+
+dt_predicted_values_train2 <- predict(dt_model2, newdata = train_data_liver, type = "class")
+dt_actual_values_train2 <- as.factor(train_data_liver$outcome)
+dt_conf_matrix_train2 <- confusionMatrix(dt_predicted_values_train2, dt_actual_values_train2, positive = "case")
+dt_conf_matrix_train2
+
+dt_predicted_values_test2 <- predict(dt_model2, newdata = test_data_liver, type = "class")
+dt_actual_values_test2 <- as.factor(test_data_liver$outcome)
+dt_conf_matrix_test2 <- confusionMatrix(dt_predicted_values_test2, dt_actual_values_test2, positive = "case")
+dt_conf_matrix_test2
+
+# make nice visualization
+pdf("decisionTree_APAP_231109.pdf", height = 5, width = 7)
+prp(dt_model2, branch = 1, box.palette = c("#a4c3d8", "#eb8c5a"), cex = 0.5, type = 5, varlen = 12)
+dev.off()
+
+rm(dt_predicted_values_train2, dt_actual_values_train2, dt_predicted_values_test2, dt_actual_values_test2)
+
+```
+
+### case control study APAP/liver: knn with caret
+```{r}
+set.seed(2)
+
+knn_model <- caret::train(outcome ~., data = train_data_liver_stand,
+                          method = "knn", 
+                          trControl = my_train_control, 
+                          tuneLength = 10,
+                          weights = my_weights,
+                          metric = "ROC") 
+
+# calculate confusion matrix and metrics train
+knn_predicted_values_train <- predict(knn_model, newdata = train_data_liver_stand)
+knn_actual_values_train <- as.factor(train_data_liver$outcome)
+knn_conf_matrix_train <- confusionMatrix(knn_predicted_values_train, knn_actual_values_train, positive = "case")
+knn_conf_matrix_train
+
+# calculate confusion matrix test
+knn_predicted_values_test <- predict(knn_model, newdata = test_data_liver_stand)
+knn_actual_values_test <- as.factor(test_data_liver_stand$outcome)
+knn_conf_matrix_test <- confusionMatrix(knn_predicted_values_test, knn_actual_values_test, positive = "case")
+knn_conf_matrix_test
+
+rm(knn_predicted_values_train, knn_actual_values_train, knn_predicted_values_test, knn_actual_values_test)
+```
+
+### case control study APAP/livery: custom tuned random Forest 
+```{r}
+set.seed(42)
+
+# run RF with optimal parameters
+rf_model2 <- randomForest(x = train_data_liver[, -4], y = train_data_liver[, 4] , maxnodes = 8, ntree = 70, weights = my_weights)
+rf_model2
+
+# calculate confusion matrix train
+rf_predicted_values_train2 <- predict(rf_model2, train_data_liver[, -4])
+rf_actual_values_train2 <- as.factor(train_data_liver[, 4])
+rf_conf_matrix_train2 <- confusionMatrix(rf_predicted_values_train2, rf_actual_values_train2, positive = "case")
+rf_conf_matrix_train2
+
+# calculate confusion matrix test
+rf_predicted_values_test2 <- predict(rf_model2, test_data_liver[, -4])
+rf_actual_values_test2 <- as.factor(test_data_liver[, 4])
+rf_conf_matrix_test2 <- confusionMatrix(rf_predicted_values_test2, rf_actual_values_test2, positive = "case")
+rf_conf_matrix_test2
+
+rm(rf_predicted_values_train2, rf_predicted_values_test2, rf_actual_values_train2, rf_actual_values_test2)
+```
+
+### case control study APAP/liver: AdaBoost with caret
+```{r}
+
+set.seed(42)
+
+fitGrid <- expand.grid(mfinal = seq(100, 200, by = 20), 
+                       maxdepth = seq(2, 5, by = 1),
+                       coeflearn = c("Breiman", "Freund"))
+
+ada_model <- caret::train(outcome ~ ., 
+                  data = train_data_liver, 
+                  method = "AdaBoost.M1", 
+                  tuneGrid = fitGrid,
+                  trControl = my_train_control,
+                  weights = my_weights,
+                  metric = "ROC")
+
+# calculate confusion matrix train
+ada_predicted_values_train <- predict(ada_model, newdata = train_data_liver)
+ada_actual_values_train <- as.factor(train_data_liver$outcome)
+ada_conf_matrix_train <- confusionMatrix(ada_predicted_values_train, ada_actual_values_train, positive = "case")
+ada_conf_matrix_train
+
+# calculate confusion matrix test
+ada_predicted_values_test <- predict(ada_model, newdata = test_data_liver)
+ada_actual_values_test <- as.factor(test_data_liver$outcome)
+ada_conf_matrix_test <- confusionMatrix(ada_predicted_values_test, ada_actual_values_test, positive = "case")
+ada_conf_matrix_test
+
+rm(ada_predicted_values_test, ada_predicted_values_train, ada_actual_values_test, ada_actual_values_train)
+
+```
+
+## Results
+
+### case control study APAP/liver: assemble results
+```{r}
+
+# logistic regression caret
+lr_overall_train <- lr_conf_matrix_train$overall
+lr_accConf_train <- paste(round(lr_overall_train[["Accuracy"]], digits = 2), " (", round(lr_overall_train[["AccuracyLower"]], digits = 2), " - ", round(lr_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+lr_byClass_train <- lr_conf_matrix_train$byClass
+lr_sens_train <- lr_byClass_train["Sensitivity"]
+lr_spec_train <- lr_byClass_train["Specificity"]
+lr_PPV_train <- lr_byClass_train["Pos Pred Value"]
+lr_NPV_train <- lr_byClass_train["Neg Pred Value"]
+lr_prec_train <- lr_byClass_train["Precision"]
+lr_rec_train <- lr_byClass_train["Recall"]
+lr_F1_train <- lr_byClass_train["F1"]
+lr_balAc_train <- lr_byClass_train["Balanced Accuracy"]
+
+lr_overall_test <- lr_conf_matrix_test$overall
+lr_accConf_test <- paste(round(lr_overall_test[["Accuracy"]], digits = 2), " (", round(lr_overall_test[["AccuracyLower"]], digits = 2), " - ", round(lr_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+lr_byClass_test <- lr_conf_matrix_test$byClass
+lr_sens_test <- lr_byClass_test["Sensitivity"]
+lr_spec_test <- lr_byClass_test["Specificity"]
+lr_PPV_test <- lr_byClass_test["Pos Pred Value"]
+lr_NPV_test <- lr_byClass_test["Neg Pred Value"]
+lr_prec_test <- lr_byClass_test["Precision"]
+lr_rec_test <- lr_byClass_test["Recall"]
+lr_F1_test <- lr_byClass_test["F1"]
+lr_balAc_test <- lr_byClass_test["Balanced Accuracy"]
+
+LR_train = c(lr_balAc_train, lr_sens_train, lr_spec_train, lr_PPV_train, lr_NPV_train, lr_prec_train, lr_rec_train, lr_F1_train)
+LR_test = c(lr_balAc_test, lr_sens_test, lr_spec_test, lr_PPV_test, lr_NPV_test, lr_prec_test, lr_rec_test, lr_F1_test)
+
+rm(lr_overall_train, lr_byClass_train, lr_sens_train, lr_spec_train, lr_PPV_train, lr_NPV_train, lr_prec_train, lr_rec_train, lr_F1_train, lr_balAc_train, lr_overall_test, lr_byClass_test, lr_sens_test, lr_spec_test, lr_PPV_test, lr_NPV_test, lr_prec_test, lr_rec_test, lr_F1_test, lr_balAc_test)
+
+# decision tree custom
+dt2_overall_train <- dt_conf_matrix_train2$overall
+dt2_accConf_train <- paste(round(dt2_overall_train[["Accuracy"]], digits = 2), " (", round(dt2_overall_train[["AccuracyLower"]], digits = 2), " - ", round(dt2_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+dt2_byClass_train <- dt_conf_matrix_train2$byClass
+dt2_sens_train <- dt2_byClass_train["Sensitivity"]
+dt2_spec_train <- dt2_byClass_train["Specificity"]
+dt2_PPV_train <- dt2_byClass_train["Pos Pred Value"]
+dt2_NPV_train <- dt2_byClass_train["Neg Pred Value"]
+dt2_prec_train <- dt2_byClass_train["Precision"]
+dt2_rec_train <- dt2_byClass_train["Recall"]
+dt2_F1_train <- dt2_byClass_train["F1"]
+dt2_balAc_train <- dt2_byClass_train["Balanced Accuracy"]
+
+dt2_overall_test <- dt_conf_matrix_test2$overall
+dt2_accConf_test <- paste(round(dt2_overall_test[["Accuracy"]], digits = 2), " (", round(dt2_overall_test[["AccuracyLower"]], digits = 2), " - ", round(dt2_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+dt2_byClass_test <- dt_conf_matrix_test2$byClass
+dt2_sens_test <- dt2_byClass_test["Sensitivity"]
+dt2_spec_test <- dt2_byClass_test["Specificity"]
+dt2_PPV_test <- dt2_byClass_test["Pos Pred Value"]
+dt2_NPV_test <- dt2_byClass_test["Neg Pred Value"]
+dt2_prec_test <- dt2_byClass_test["Precision"]
+dt2_rec_test <- dt2_byClass_test["Recall"]
+dt2_F1_test <- dt2_byClass_test["F1"]
+dt2_balAc_test <- dt2_byClass_test["Balanced Accuracy"]
+
+DT_train = c(dt2_balAc_train, dt2_sens_train, dt2_spec_train, dt2_PPV_train, dt2_NPV_train, dt2_prec_train, dt2_rec_train, dt2_F1_train)
+DT_test = c(dt2_balAc_test, dt2_sens_test, dt2_spec_test, dt2_PPV_test, dt2_NPV_test, dt2_prec_test, dt2_rec_test, dt2_F1_test)
+
+rm(dt2_sens_train, dt2_spec_train, dt2_PPV_train, dt2_NPV_train, dt2_prec_train, dt2_rec_train, dt2_F1_train, dt2_balAc_train, dt2_sens_test, dt2_spec_test, dt2_PPV_test, dt2_NPV_test, dt2_prec_test, dt2_rec_test, dt2_F1_test, dt2_balAc_test)
+
+# knn caret
+knn_overall_train <- knn_conf_matrix_train$overall
+knn_accConf_train <- paste(round(knn_overall_train[["Accuracy"]], digits = 2), " (", round(knn_overall_train[["AccuracyLower"]], digits = 2), " - ", round(knn_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+knn_byClass_train <- knn_conf_matrix_train$byClass
+knn_sens_train <- knn_byClass_train["Sensitivity"]
+knn_spec_train <- knn_byClass_train["Specificity"]
+knn_PPV_train <- knn_byClass_train["Pos Pred Value"]
+knn_NPV_train <- knn_byClass_train["Neg Pred Value"]
+knn_prec_train <- knn_byClass_train["Precision"]
+knn_rec_train <- knn_byClass_train["Recall"]
+knn_F1_train <- knn_byClass_train["F1"]
+knn_balAc_train <- knn_byClass_train["Balanced Accuracy"]
+
+knn_overall_test <- knn_conf_matrix_test$overall
+knn_accConf_test <- paste(round(knn_overall_test[["Accuracy"]], digits = 2), " (", round(knn_overall_test[["AccuracyLower"]], digits = 2), " - ", round(knn_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+knn_byClass_test <- knn_conf_matrix_test$byClass
+knn_sens_test <- knn_byClass_test["Sensitivity"]
+knn_spec_test <- knn_byClass_test["Specificity"]
+knn_PPV_test <- knn_byClass_test["Pos Pred Value"]
+knn_NPV_test <- knn_byClass_test["Neg Pred Value"]
+knn_prec_test <- knn_byClass_test["Precision"]
+knn_rec_test <- knn_byClass_test["Recall"]
+knn_F1_test <- knn_byClass_test["F1"]
+knn_balAc_test <- knn_byClass_test["Balanced Accuracy"]
+
+KNN_train = c(knn_balAc_train, knn_sens_train, knn_spec_train, knn_PPV_train, knn_NPV_train, knn_prec_train, knn_rec_train, knn_F1_train)
+KNN_test = c(knn_balAc_test, knn_sens_test, knn_spec_test, knn_PPV_test, knn_NPV_test, knn_prec_test, knn_rec_test, knn_F1_test)
+
+rm(knn_sens_train, knn_spec_train, knn_PPV_train, knn_NPV_train, knn_prec_train, knn_rec_train, knn_F1_train, knn_balAc_train, knn_sens_test, knn_spec_test, knn_PPV_test, knn_NPV_test, knn_prec_test, knn_rec_test, knn_F1_test, knn_balAc_test)
+
+# random forest custom
+rf2_overall_train <- rf_conf_matrix_train2$overall
+rf2_accConf_train <- paste(round(rf2_overall_train[["Accuracy"]], digits = 2), " (", round(rf2_overall_train[["AccuracyLower"]], digits = 2), " - ", round(rf2_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+rf2_byClass_train <- rf_conf_matrix_train2$byClass
+rf2_sens_train <- rf2_byClass_train["Sensitivity"]
+rf2_spec_train <- rf2_byClass_train["Specificity"]
+rf2_PPV_train <- rf2_byClass_train["Pos Pred Value"]
+rf2_NPV_train <- rf2_byClass_train["Neg Pred Value"]
+rf2_prec_train <- rf2_byClass_train["Precision"]
+rf2_rec_train <- rf2_byClass_train["Recall"]
+rf2_F1_train <- rf2_byClass_train["F1"]
+rf2_balAc_train <- rf2_byClass_train["Balanced Accuracy"]
+
+rf2_overall_test <- rf_conf_matrix_test2$overall
+rf2_accConf_test <- paste(round(rf2_overall_test[["Accuracy"]], digits = 2), " (", round(rf2_overall_test[["AccuracyLower"]], digits = 2), " - ", round(rf2_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+rf2_byClass_test <- rf_conf_matrix_test2$byClass
+rf2_sens_test <- rf2_byClass_test["Sensitivity"]
+rf2_spec_test <- rf2_byClass_test["Specificity"]
+rf2_PPV_test <- rf2_byClass_test["Pos Pred Value"]
+rf2_NPV_test <- rf2_byClass_test["Neg Pred Value"]
+rf2_prec_test <- rf2_byClass_test["Precision"]
+rf2_rec_test <- rf2_byClass_test["Recall"]
+rf2_F1_test <- rf2_byClass_test["F1"]
+rf2_balAc_test <- rf2_byClass_test["Balanced Accuracy"]
+
+RF_train = c(rf2_balAc_train, rf2_sens_train, rf2_spec_train, rf2_PPV_train, rf2_NPV_train, rf2_prec_train, rf2_rec_train, rf2_F1_train)
+RF_test = c(rf2_balAc_test, rf2_sens_test, rf2_spec_test, rf2_PPV_test, rf2_NPV_test, rf2_prec_test, rf2_rec_test, rf2_F1_test)
+
+rm(rf2_sens_train, rf2_spec_train, rf2_PPV_train, rf2_NPV_train, rf2_prec_train, rf2_rec_train, rf2_F1_train, rf2_balAc_train, rf2_sens_test, rf2_spec_test, rf2_PPV_test, rf2_NPV_test, rf2_prec_test, rf2_rec_test, rf2_F1_test, rf2_balAc_test)
+
+# AdaBoost
+ada_overall_train <- ada_conf_matrix_train$overall
+ada_accConf_train <- paste(round(ada_overall_train[["Accuracy"]], digits = 2), " (", round(ada_overall_train[["AccuracyLower"]], digits = 2), " - ", round(ada_overall_train[["AccuracyUpper"]], digits = 2), ")", sep = "")
+ada_byClass_train <- ada_conf_matrix_train$byClass
+ada_sens_train <- ada_byClass_train["Sensitivity"]
+ada_spec_train <- ada_byClass_train["Specificity"]
+ada_PPV_train <- ada_byClass_train["Pos Pred Value"]
+ada_NPV_train <- ada_byClass_train["Neg Pred Value"]
+ada_prec_train <- ada_byClass_train["Precision"]
+ada_rec_train <- ada_byClass_train["Recall"]
+ada_F1_train <- ada_byClass_train["F1"]
+ada_balAc_train <- ada_byClass_train["Balanced Accuracy"]
+
+ada_overall_test <- ada_conf_matrix_test$overall
+ada_accConf_test <- paste(round(ada_overall_test[["Accuracy"]], digits = 2), " (", round(ada_overall_test[["AccuracyLower"]], digits = 2), " - ", round(ada_overall_test[["AccuracyUpper"]], digits = 2), ")", sep = "")
+ada_byClass_test <- ada_conf_matrix_test$byClass
+ada_sens_test <- ada_byClass_test["Sensitivity"]
+ada_spec_test <- ada_byClass_test["Specificity"]
+ada_PPV_test <- ada_byClass_test["Pos Pred Value"]
+ada_NPV_test <- ada_byClass_test["Neg Pred Value"]
+ada_prec_test <- ada_byClass_test["Precision"]
+ada_rec_test <- ada_byClass_test["Recall"]
+ada_F1_test <- ada_byClass_test["F1"]
+ada_balAc_test <- ada_byClass_test["Balanced Accuracy"]
+
+AB_train = c(ada_balAc_train, ada_sens_train, ada_spec_train, ada_PPV_train, ada_NPV_train, ada_prec_train, ada_rec_train, ada_F1_train)
+AB_test = c(ada_balAc_test, ada_sens_test, ada_spec_test, ada_PPV_test, ada_NPV_test, ada_prec_test, ada_rec_test, ada_F1_test)
+
+rm(ada_overall_train, ada_sens_train, ada_spec_train, ada_PPV_train, ada_NPV_train, ada_prec_train, ada_rec_train, ada_F1_train, ada_balAc_train, ada_overall_test, ada_sens_test, ada_spec_test, ada_PPV_test, ada_NPV_test, ada_prec_test, ada_rec_test, ada_F1_test, ada_balAc_test)
+
+# assemble table
+results_APAP_table <- round_df(data.frame(LR_train, LR_test, DT_train, DT_test, RF_train, RF_test, KNN_train, KNN_test, AB_train, AB_test), digits = 2)
+
+# accuracy
+accConf <- c(lr_accConf_train, lr_accConf_test, dt2_accConf_train, dt2_accConf_test, rf2_accConf_train, rf2_accConf_test, knn_accConf_train, knn_accConf_test, ada_accConf_train, ada_accConf_test)
+
+results_APAP_table <- rbind(accConf, results_APAP_table)
+rownames(results_APAP_table) <- c("Accuracy", "Balanced Accuracy", "Sensitivity", "Specificity", "PPV", "NPV", "Precision", "Recall", "F1 Score")
+
+write_xlsx(results_APAP_table, "results_APAA_231101.xlsx")
+
+pdf("results_APAP_231109.pdf", width = 18, height = 5)
+results_APAP_table <- tableGrob(data.frame(results_APAP_table))
+grid.arrange(results_APAP_table)
+dev.off()
+
+```
